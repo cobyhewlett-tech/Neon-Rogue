@@ -1,0 +1,110 @@
+{
+  "entities": {
+    "DailyScoreEntry": {
+      "title": "DailyScoreEntry",
+      "description": "A verified player's best Daily Challenge run score for a specific UTC date.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the player",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "dateKey": {
+          "type": "string",
+          "description": "UTC date key (YYYY-MM-DD) identifying the 24-hour challenge window",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "challengeCode": {
+          "type": "string",
+          "description": "Deterministic daily challenge code (e.g. NR-20261124)",
+          "minLength": 3,
+          "maxLength": 32
+        },
+        "pilotName": {
+          "type": "string",
+          "description": "Public pilot callsign displayed on the leaderboard (no PII)",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "shipId": {
+          "type": "string",
+          "description": "Identifier of the fixed daily vessel class",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "shipName": {
+          "type": "string",
+          "description": "Display name of the fixed daily vessel class",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "mutatorName": {
+          "type": "string",
+          "description": "Name of the daily sector mutator",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "score": {
+          "type": "integer",
+          "description": "Highest score achieved in this daily challenge window"
+        },
+        "kills": {
+          "type": "integer",
+          "description": "Enemies neutralized during the best daily run"
+        },
+        "survivalTime": {
+          "type": "integer",
+          "description": "Survival duration in seconds during the best daily run"
+        },
+        "level": {
+          "type": "integer",
+          "description": "Pilot level reached during the best daily run"
+        },
+        "bossesDefeated": {
+          "type": "integer",
+          "description": "Bosses defeated during the best daily run"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the daily entry was first created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the daily best score was last updated"
+        }
+      },
+      "required": [
+        "uid",
+        "dateKey",
+        "challengeCode",
+        "pilotName",
+        "shipId",
+        "shipName",
+        "mutatorName",
+        "score",
+        "kills",
+        "survivalTime",
+        "level",
+        "bossesDefeated",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/daily_scores/{entryId}": {
+      "schema": {
+        "$ref": "#/entities/DailyScoreEntry"
+      },
+      "description": "Stores each player's personal best score for a given 24-hour UTC Daily Challenge window, keyed by {dateKey}_{uid}."
+    }
+  }
+}

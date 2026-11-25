@@ -1,0 +1,6 @@
+{
+  "name": "Neon Rogue: Cyber Survivor",
+  "description": "An adrenaline-fueled top-down neon roguelite survival game with modular weapons, dynamic upgrades, epic boss encounters, and procedural synth audio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
