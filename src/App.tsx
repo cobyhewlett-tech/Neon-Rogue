@@ -1,12 +1,15 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import {
+  ChatMessageItem,
   DailyChallengeConfig,
   DailyLeaderboardEntry,
   GameMode,
   GameSettings,
   GameStatus,
   HighScoreEntry,
+  OnlinePilotSummary,
+  OnlineRoomInfo,
   PlayerStats,
   RunSummary,
   ShipClass,
@@ -19,12 +22,15 @@ import {
   getDailyChallengeConfig,
 } from './game/daily';
 import { soundEngine } from './utils/audio';
+import { realtimeClient } from './utils/realtime';
 import {
   auth,
+  saveChatMessageToFirestore,
   signInWithGoogle,
   signOutPilot,
   submitDailyScore,
   subscribeDailyLeaderboard,
+  subscribeGlobalChat,
 } from './utils/firebase';
 import { MainMenu } from './components/MainMenu';
 import { HUD } from './components/HUD';
@@ -66,6 +72,20 @@ export default function App() {
   // Firebase Auth State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authBusy, setAuthBusy] = useState<boolean>(false);
+
+  // Online Co-op & Live Chat State
+  const [pilotName, setPilotName] = useState<string>(() => {
+    return `Pilot-${Math.floor(100 + Math.random() * 900)}`;
+  });
+  const [customPilotEdited, setCustomPilotEdited] = useState(false);
+  const [onlineRoomId, setOnlineRoomId] = useState<string>('PUBLIC');
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [onlineCount, setOnlineCount] = useState<number>(1);
+  const [onlinePilots, setOnlinePilots] = useState<OnlinePilotSummary[]>([]);
+  const [activeRooms, setActiveRooms] = useState<OnlineRoomInfo[]>([]);
+  const [squadPlayerCount, setSquadPlayerCount] = useState<number>(1);
+  const [wsMessages, setWsMessages] = useState<ChatMessageItem[]>([]);
+  const [firestoreMessages, setFirestoreMessages] = useState<ChatMessageItem[]>([]);
 
   // LocalStorage state
   const [highScores, setHighScores] = useState<HighScoreEntry[]>(() => {
@@ -135,9 +155,96 @@ export default function App() {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
+      if (user && !customPilotEdited) {
+        const name = (user.displayName || user.email?.split('@')[0] || '').trim().slice(0, 24);
+        if (name) {
+          setPilotName(name);
+        }
+      }
     });
     return () => unsubscribe();
+  }, [customPilotEdited]);
+
+  // Realtime WebSocket Presence & Live Chat Subscription
+  useEffect(() => {
+    const mergeHistory = (incoming: ChatMessageItem[]) => {
+      if (!incoming || incoming.length === 0) return;
+      setWsMessages((prev) => {
+        const seen = new Set(prev.map((m) => m.id));
+        const additions = incoming.filter((m) => m && !seen.has(m.id));
+        if (additions.length === 0) return prev;
+        return [...prev, ...additions].sort((a, b) => a.timestamp - b.timestamp).slice(-80);
+      });
+    };
+
+    const unsubscribe = realtimeClient.subscribe({
+      onConnectionChange: (connected) => {
+        setWsConnected(connected);
+      },
+      onPresence: (count, pilots, rooms) => {
+        setOnlineCount(count);
+        setOnlinePilots(pilots);
+        setActiveRooms(rooms);
+      },
+      onChatHistory: (history) => {
+        mergeHistory(history);
+      },
+      onRoomJoined: (payload) => {
+        mergeHistory(payload.squadHistory);
+      },
+      onChatMessage: (message) => {
+        setWsMessages((prev) => {
+          if (prev.some((m) => m.id === message.id)) return prev;
+          return [...prev, message].slice(-80);
+        });
+      },
+    });
+
+    return () => unsubscribe();
   }, []);
+
+  // Sync Pilot Callsign to WebSocket Server
+  useEffect(() => {
+    const shipName = engineRef.current?.selectedShip.name || SHIP_CLASSES[0].name;
+    realtimeClient.updateIdentity(pilotName || 'Rogue Pilot', shipName);
+  }, [pilotName]);
+
+  // Subscribe to persistent Firestore global chat when signed in
+  useEffect(() => {
+    if (!currentUser) {
+      setFirestoreMessages([]);
+      return;
+    }
+    const unsubscribe = subscribeGlobalChat(
+      'global',
+      (msgs) => {
+        setFirestoreMessages(msgs);
+      },
+      (err) => {
+        console.error('Global chat subscription error:', err);
+      }
+    );
+    return () => unsubscribe();
+  }, [currentUser]);
+
+  // Merge & deduplicate real-time WebSocket chat + persisted Firestore chat
+  const chatMessages = useMemo(() => {
+    const combined: ChatMessageItem[] = [...wsMessages];
+    for (const fm of firestoreMessages) {
+      const duplicate = combined.some(
+        (wm) =>
+          wm.id === fm.id ||
+          (wm.channel === fm.channel &&
+            wm.pilotName === fm.pilotName &&
+            wm.text === fm.text &&
+            Math.abs(wm.timestamp - fm.timestamp) < 8000)
+      );
+      if (!duplicate) {
+        combined.push(fm);
+      }
+    }
+    return combined.sort((a, b) => a.timestamp - b.timestamp).slice(-80);
+  }, [wsMessages, firestoreMessages]);
 
   // 24-hour UTC Reset Countdown & Midnight Rollover
   useEffect(() => {
@@ -202,6 +309,9 @@ export default function App() {
       onVictory: (summary) => {
         handleRunFinishedRef.current(summary, true);
       },
+      onRemotePlayersCount: (count) => {
+        setSquadPlayerCount(count);
+      },
     });
 
     engineRef.current = engine;
@@ -240,6 +350,15 @@ export default function App() {
   // Global Keyboard Controls
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+
       // Toggle Pause on Escape
       if (e.code === 'Escape') {
         if (gameStatus === 'playing') {
@@ -314,7 +433,27 @@ export default function App() {
     setGameStatus('playing');
     setBossState(null);
     setDailySubmitStatus('idle');
-    engineRef.current.startRun(ship, mode, mode === 'daily' ? dailyConfig : undefined);
+    setSquadPlayerCount(1);
+    const effectiveRoom = onlineRoomId.trim() || 'PUBLIC';
+    const effectivePilot = pilotName.trim() || 'Rogue Pilot';
+    engineRef.current.startRun(
+      ship,
+      mode,
+      mode === 'daily' ? dailyConfig : undefined,
+      mode === 'online' ? { roomId: effectiveRoom, pilotName: effectivePilot } : undefined
+    );
+  };
+
+  // Send Live Chat message
+  const handleSendChatMessage = (text: string, scope: 'global' | 'squad') => {
+    const effectivePilot = pilotName.trim() || 'Rogue Pilot';
+    const shipName = engineRef.current?.selectedShip.name || SHIP_CLASSES[0].name;
+    realtimeClient.sendChat(text, scope, effectivePilot, shipName);
+    if (scope === 'global' && currentUser) {
+      void saveChatMessageToFirestore(currentUser, 'global', effectivePilot, shipName, text).catch(
+        (err) => console.error('Failed to persist global chat message:', err)
+      );
+    }
   };
 
   // Upgrades
@@ -498,6 +637,19 @@ export default function App() {
           localDailyBest={localDailyBest}
           currentUser={currentUser}
           authBusy={authBusy}
+          pilotName={pilotName}
+          onPilotNameChange={(name) => {
+            setCustomPilotEdited(true);
+            setPilotName(name);
+          }}
+          onlineRoomId={onlineRoomId}
+          onOnlineRoomIdChange={setOnlineRoomId}
+          onlineCount={onlineCount}
+          onlinePilots={onlinePilots}
+          activeRooms={activeRooms}
+          wsConnected={wsConnected}
+          chatMessages={chatMessages}
+          onSendChatMessage={handleSendChatMessage}
           onSignIn={handleSignIn}
           onSignOut={handleSignOut}
           onToggleMute={toggleMute}
@@ -516,6 +668,13 @@ export default function App() {
             highScore={highestScore}
             gameMode={activeGameMode}
             dailyCode={activeGameMode === 'daily' ? dailyConfig.challengeCode : undefined}
+            onlineRoomId={activeGameMode === 'online' ? onlineRoomId || 'PUBLIC' : undefined}
+            squadPlayerCount={squadPlayerCount}
+            onlineCount={onlineCount}
+            wsConnected={wsConnected}
+            pilotName={pilotName}
+            chatMessages={chatMessages}
+            onSendChatMessage={handleSendChatMessage}
             bossState={bossState}
             isMuted={settings.audio.muted}
             autoFire={settings.autoFire}
@@ -570,10 +729,15 @@ export default function App() {
             if (engineRef.current) {
               setGameStatus('playing');
               setDailySubmitStatus('idle');
+              setSquadPlayerCount(1);
+              const mode = engineRef.current.gameMode;
               engineRef.current.startRun(
                 engineRef.current.selectedShip,
-                engineRef.current.gameMode,
-                engineRef.current.gameMode === 'daily' ? dailyConfig : undefined
+                mode,
+                mode === 'daily' ? dailyConfig : undefined,
+                mode === 'online'
+                  ? { roomId: onlineRoomId.trim() || 'PUBLIC', pilotName: pilotName.trim() || 'Rogue Pilot' }
+                  : undefined
               );
             }
           }}
@@ -599,10 +763,14 @@ export default function App() {
               const ship = SHIP_CLASSES.find((s) => s.id === runSummary.shipId) || SHIP_CLASSES[0];
               setGameStatus('playing');
               setDailySubmitStatus('idle');
+              setSquadPlayerCount(1);
               engineRef.current.startRun(
                 ship,
                 runSummary.gameMode,
-                runSummary.gameMode === 'daily' ? dailyConfig : undefined
+                runSummary.gameMode === 'daily' ? dailyConfig : undefined,
+                runSummary.gameMode === 'online'
+                  ? { roomId: onlineRoomId.trim() || 'PUBLIC', pilotName: pilotName.trim() || 'Rogue Pilot' }
+                  : undefined
               );
             }
           }}

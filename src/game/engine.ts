@@ -2,11 +2,13 @@ import {
   DailyChallengeConfig,
   GameMode,
   PlayerStats,
+  RemotePlayerState,
   RunSummary,
   ShipClass,
   UpgradeDefinition,
 } from '../types';
 import { soundEngine } from '../utils/audio';
+import { realtimeClient, RemoteBulletPayload } from '../utils/realtime';
 import { SHIP_CLASSES, UPGRADE_CATALOG } from './constants';
 import { createSeededRng } from './daily';
 
@@ -112,6 +114,7 @@ export interface EngineCallbacks {
   onBossState: (boss: { name: string; hp: number; maxHp: number } | null) => void;
   onGameOver: (summary: RunSummary) => void;
   onVictory: (summary: RunSummary) => void;
+  onRemotePlayersCount?: (count: number) => void;
 }
 
 export class GameEngine {
@@ -143,6 +146,14 @@ export class GameEngine {
   public selectedShip: ShipClass = SHIP_CLASSES[0];
   public gameMode: GameMode = 'survivor';
   public dailyConfig: DailyChallengeConfig | null = null;
+  public onlineRoomId = 'PUBLIC';
+  public pilotName = 'Rogue Pilot';
+  public remotePlayers: RemotePlayerState[] = [];
+  public remoteBullets: Bullet[] = [];
+  private onlineUnsubscribe: (() => void) | null = null;
+  private stateSyncTimer = 0;
+  private pendingDropClaims = new Set<number>();
+  private onlineDmgAccum = new Map<number, number>();
   public survivalTime = 0; // seconds
   public score = 0;
   public kills = 0;
@@ -264,9 +275,24 @@ export class GameEngine {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  public startRun(ship: ShipClass, mode: GameMode = 'survivor', dailyConfig?: DailyChallengeConfig) {
+  public startRun(
+    ship: ShipClass,
+    mode: GameMode = 'survivor',
+    dailyConfig?: DailyChallengeConfig,
+    onlineOptions?: { roomId: string; pilotName: string }
+  ) {
+    if (this.onlineUnsubscribe) {
+      this.onlineUnsubscribe();
+      this.onlineUnsubscribe = null;
+    }
+    if (mode !== 'online') {
+      realtimeClient.leaveRoom();
+    }
+
     this.gameMode = mode;
     this.dailyConfig = mode === 'daily' && dailyConfig ? dailyConfig : null;
+    this.onlineRoomId = onlineOptions?.roomId || 'PUBLIC';
+    this.pilotName = onlineOptions?.pilotName || 'Rogue Pilot';
     const effectiveShip = this.dailyConfig ? this.dailyConfig.ship : ship;
     this.selectedShip = effectiveShip;
 
@@ -296,6 +322,11 @@ export class GameEngine {
     this.damageDealt = 0;
     this.bossesDefeated = 0;
     this.shakeAmount = 0;
+    this.remotePlayers = [];
+    this.remoteBullets = [];
+    this.pendingDropClaims.clear();
+    this.onlineDmgAccum.clear();
+    this.stateSyncTimer = 0;
 
     // Reset player position & stats
     this.player.x = this.arenaWidth / 2;
@@ -351,8 +382,13 @@ export class GameEngine {
     this.singularities = [];
     this.shockwaveRings = [];
 
-    // Generate tactical Hiding Spots across the arena
-    this.generateHidingSpots(mutator ? mutator.hidingSpotCount : 9, 92);
+    if (mode === 'online') {
+      this.hidingSpots = [];
+      this.setupOnlineMode(effectiveShip, maxHealth);
+    } else {
+      // Generate tactical Hiding Spots across the arena
+      this.generateHidingSpots(mutator ? mutator.hidingSpotCount : 9, 92);
+    }
 
     // Grant Daily Challenge starting module if applicable
     if (this.dailyConfig?.startingUpgradeId) {
@@ -389,6 +425,214 @@ export class GameEngine {
       cancelAnimationFrame(this.animationFrameId);
     }
     this.loop(performance.now());
+  }
+
+  private setupOnlineMode(ship: ShipClass, maxHealth: number) {
+    this.onlineUnsubscribe = realtimeClient.subscribe({
+      onRoomJoined: (payload) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        this.player.x = payload.spawnX;
+        this.player.y = payload.spawnY;
+        this.lastKnownPlayerPos = { x: payload.spawnX, y: payload.spawnY };
+        this.hidingSpots = payload.hidingSpots || [];
+        this.addFloatingText(
+          this.player.x,
+          this.player.y - 40,
+          `SQUAD ${payload.roomId} CONNECTED`,
+          '#38bdf8',
+          16,
+          true
+        );
+      },
+      onRoomSnapshot: (snapshot) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        this.survivalTime = snapshot.survivalTime;
+        if (Array.isArray(snapshot.hidingSpots) && snapshot.hidingSpots.length > 0) {
+          if (this.hidingSpots.length !== snapshot.hidingSpots.length) {
+            this.hidingSpots = snapshot.hidingSpots;
+          } else {
+            for (let i = 0; i < snapshot.hidingSpots.length; i++) {
+              this.hidingSpots[i].pulsePhase = snapshot.hidingSpots[i].pulsePhase;
+            }
+          }
+        }
+
+        const myId = realtimeClient.clientId;
+        this.remotePlayers = snapshot.players.filter((pl) => pl.id !== myId);
+        this.callbacks.onRemotePlayersCount?.(snapshot.players.length);
+
+        // Reconcile server-authoritative enemies with smooth interpolation
+        const existingMap = new Map<number, Enemy>();
+        for (const e of this.enemies) existingMap.set(e.id, e);
+        this.enemies = snapshot.enemies.map((se) => {
+          const prev = existingMap.get(se.id);
+          if (prev) {
+            prev.x += (se.x - prev.x) * 0.55;
+            prev.y += (se.y - prev.y) * 0.55;
+            prev.vx = se.vx;
+            prev.vy = se.vy;
+            prev.hp = se.hp;
+            prev.maxHp = se.maxHp;
+            prev.angle = se.angle;
+            prev.attackTimer = se.attackTimer ?? 0;
+            prev.isCharging = se.isCharging;
+            prev.isBoss = se.isBoss;
+            return prev;
+          }
+          return {
+            ...se,
+            specialTimer: 0,
+          };
+        });
+
+        // Reconcile drops (preserve locally magnetized drops)
+        const existingDropMap = new Map<number, DropItem>();
+        for (const d of this.drops) existingDropMap.set(d.id, d);
+        this.drops = snapshot.drops.map((sd) => {
+          const prev = existingDropMap.get(sd.id);
+          if (prev) {
+            return prev;
+          }
+          return {
+            ...sd,
+            pulseTimer: Math.random() * Math.PI,
+          };
+        });
+
+        this.callbacks.onBossState(snapshot.boss);
+      },
+      onRemoteFire: (_pilotId, bullets) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        for (const b of bullets) {
+          this.remoteBullets.push({
+            x: b.x,
+            y: b.y,
+            vx: b.vx,
+            vy: b.vy,
+            radius: b.radius || 4.5,
+            damage: 0,
+            isCrit: b.isCrit ? 1 : 0,
+            color: b.color || '#38bdf8',
+            life: b.life ?? 1.4,
+            isEnemy: false,
+          });
+        }
+      },
+      onEnemyFire: (bullets) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        for (const b of bullets) {
+          this.bullets.push({
+            x: b.x,
+            y: b.y,
+            vx: b.vx,
+            vy: b.vy,
+            radius: b.radius || 5,
+            damage: b.damage || 18,
+            isCrit: 0,
+            color: b.color || '#ef4444',
+            life: b.life ?? 2.4,
+            isEnemy: true,
+          });
+        }
+      },
+      onRemoteDash: (payload) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        this.addShockwave(payload.x, payload.y, 60, payload.color);
+      },
+      onRemoteShockwave: (payload) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        this.addShockwave(payload.x, payload.y, payload.radius, payload.color);
+        soundEngine.playEmpNova();
+      },
+      onEnemyKilled: (payload) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        const idx = this.enemies.findIndex((e) => e.id === payload.enemyId);
+        if (idx !== -1) {
+          this.enemies.splice(idx, 1);
+        }
+        if (payload.killerId === realtimeClient.clientId) {
+          this.kills++;
+          this.score += Math.round(payload.xpValue * 1.5);
+          if (payload.isBoss) {
+            this.bossesDefeated++;
+          }
+          const singularityLvl = this.player.stats.upgrades['singularity_core'] || 0;
+          if (singularityLvl > 0) {
+            this.killsSinceSingularity++;
+            const threshold = Math.max(5, 13 - singularityLvl * 2);
+            if (this.killsSinceSingularity >= threshold) {
+              this.killsSinceSingularity = 0;
+              this.singularities.push({
+                x: payload.x,
+                y: payload.y,
+                radius: 115 + singularityLvl * 30,
+                life: 3.0 + singularityLvl * 0.3,
+              });
+              this.addShockwave(payload.x, payload.y, 80, '#c084fc');
+            }
+          }
+        }
+        if (payload.isBoss) {
+          soundEngine.setBossMusic(false);
+          soundEngine.playExplosion(2.0);
+          this.addScreenShake(16);
+        } else if (Math.hypot(payload.x - this.player.x, payload.y - this.player.y) < 750) {
+          soundEngine.playSmallExplosion();
+        }
+        const particleCount = payload.isBoss ? 40 : 10;
+        for (let i = 0; i < particleCount; i++) {
+          const pAngle = Math.random() * Math.PI * 2;
+          const pSpeed = 1 + Math.random() * (payload.isBoss ? 8 : 5);
+          this.particles.push({
+            x: payload.x,
+            y: payload.y,
+            vx: Math.cos(pAngle) * pSpeed,
+            vy: Math.sin(pAngle) * pSpeed,
+            color: payload.color,
+            size: 3 + Math.random() * 3,
+            alpha: 1,
+            decay: 0.04 + Math.random() * 0.04,
+            glow: true,
+          });
+        }
+      },
+      onDropGranted: (drop) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        this.pendingDropClaims.delete(drop.id);
+        this.collectDrop(drop);
+      },
+      onBossWarning: (bossName) => {
+        if (!this.isRunning || this.gameMode !== 'online') return;
+        soundEngine.playBossWarning();
+        soundEngine.setBossMusic(true);
+        this.addScreenShake(15);
+        this.addFloatingText(
+          this.player.x,
+          this.player.y - 100,
+          `⚠️ WARNING: ${bossName} DETECTED ⚠️`,
+          '#ef4444',
+          22,
+          true
+        );
+      },
+    });
+
+    realtimeClient.joinRoom({
+      roomId: this.onlineRoomId,
+      pilotName: this.pilotName,
+      shipId: ship.id,
+      shipName: ship.name,
+      color: ship.color,
+      accentColor: ship.accentColor,
+      maxHp: maxHealth,
+      maxShield: ship.baseShield,
+    });
+  }
+
+  private queueOnlineDamage(enemyId: number, dmg: number) {
+    if (this.gameMode !== 'online' || dmg <= 0) return;
+    const prev = this.onlineDmgAccum.get(enemyId) || 0;
+    this.onlineDmgAccum.set(enemyId, prev + dmg);
   }
 
   private generateHidingSpots(count: number, radius: number) {
@@ -446,6 +690,15 @@ export class GameEngine {
 
   public stop() {
     this.isRunning = false;
+    if (this.onlineUnsubscribe) {
+      this.onlineUnsubscribe();
+      this.onlineUnsubscribe = null;
+    }
+    if (this.gameMode === 'online') {
+      realtimeClient.leaveRoom();
+    }
+    this.remotePlayers = [];
+    this.remoteBullets = [];
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
@@ -591,6 +844,13 @@ export class GameEngine {
     soundEngine.playDash();
     this.addShockwave(this.player.x, this.player.y, 60, this.selectedShip.accentColor);
 
+    if (this.gameMode === 'online') {
+      realtimeClient.send(
+        { type: 'player:dash', x: Math.round(this.player.x), y: Math.round(this.player.y) },
+        false
+      );
+    }
+
     // Chrono special rift
     if (this.selectedShip.id === 'chrono') {
       this.singularities.push({
@@ -617,7 +877,9 @@ export class GameEngine {
   };
 
   private update(dt: number) {
-    this.survivalTime += dt;
+    if (this.gameMode !== 'online') {
+      this.survivalTime += dt;
+    }
 
     // Update hiding spots animation & compromised flash
     for (const spot of this.hidingSpots) {
@@ -627,7 +889,7 @@ export class GameEngine {
       }
     }
 
-    // Trigger Boss Encounters
+    // Trigger Boss Encounters (offline modes)
     if (this.gameMode === 'survivor') {
       if (this.survivalTime >= 180 && !this.bossSpawnedStage1) {
         this.spawnBoss('boss_goliath');
@@ -646,7 +908,7 @@ export class GameEngine {
         this.nextDailyBossTime = this.survivalTime + this.dailyConfig.mutator.bossInterval;
         this.spawnBoss(bossType);
       }
-    } else {
+    } else if (this.gameMode === 'endless') {
       // Endless mode: spawn bosses periodically
       if (this.survivalTime > 180 && Math.floor(this.survivalTime) % 180 === 0 && !this.currentBoss) {
         this.spawnBoss(Math.random() > 0.5 ? 'boss_goliath' : 'boss_nexus');
@@ -663,11 +925,50 @@ export class GameEngine {
     this.updateOrbitingOrbs(dt);
     this.updateBullets(dt);
     this.updateEnemies(dt);
-    this.updateSpawning(dt);
+    if (this.gameMode !== 'online') {
+      this.updateSpawning(dt);
+    }
     this.updateDrops(dt);
     this.updateSingularities(dt);
     this.updateParticles(dt);
     this.updateFloatingTexts(dt);
+
+    // Sync state & batched damage in Online Co-op mode at 20Hz
+    if (this.gameMode === 'online') {
+      this.stateSyncTimer += dt;
+      if (this.stateSyncTimer >= 0.05) {
+        this.stateSyncTimer = 0;
+        const p = this.player;
+        realtimeClient.send(
+          {
+            type: 'player:state',
+            x: Math.round(p.x),
+            y: Math.round(p.y),
+            angle: Number(p.angle.toFixed(3)),
+            hp: Math.round(p.stats.health),
+            maxHp: Math.round(p.stats.maxHealth),
+            shield: Math.round(p.stats.shield),
+            maxShield: Math.round(p.stats.maxShield),
+            isHidden: this.isHidden,
+            isDashing: p.isDashing,
+            level: p.stats.level,
+            score: this.score,
+            kills: this.kills,
+          },
+          false
+        );
+
+        if (this.onlineDmgAccum.size > 0) {
+          for (const [enemyId, totalDmg] of this.onlineDmgAccum.entries()) {
+            const rounded = Math.round(totalDmg);
+            if (rounded > 0) {
+              realtimeClient.send({ type: 'enemy:damage', enemyId, damage: rounded }, false);
+            }
+          }
+          this.onlineDmgAccum.clear();
+        }
+      }
+    }
 
     // Update Camera & Screen Shake
     this.updateCamera(dt);
@@ -894,36 +1195,62 @@ export class GameEngine {
       this.addFloatingText(p.x, p.y - 24, 'AMBUSH CRIT!', '#10b981', 16, true);
     }
 
+    const networkBullets: RemoteBulletPayload[] = [];
+
     for (let i = 0; i < count; i++) {
       const angle = startAngle + i * spread;
       const isCrit = isAmbush || this.combatRng() < p.stats.critChance;
       const dmg = Math.round(p.stats.damage * (isCrit ? p.stats.critMultiplier : 1) * ambushMult);
+      const bx = p.x + Math.cos(p.angle) * 18;
+      const by = p.y + Math.sin(p.angle) * 18;
+      const bvx = Math.cos(angle) * p.stats.bulletSpeed;
+      const bvy = Math.sin(angle) * p.stats.bulletSpeed;
+      const radius = isAmbush ? 7 : isCrit ? 6 : 4.5;
+      const color = isAmbush ? '#10b981' : isCrit ? '#f59e0b' : this.selectedShip.accentColor;
 
       this.bullets.push({
-        x: p.x + Math.cos(p.angle) * 18,
-        y: p.y + Math.sin(p.angle) * 18,
-        vx: Math.cos(angle) * p.stats.bulletSpeed,
-        vy: Math.sin(angle) * p.stats.bulletSpeed,
-        radius: isAmbush ? 7 : isCrit ? 6 : 4.5,
+        x: bx,
+        y: by,
+        vx: bvx,
+        vy: bvy,
+        radius,
         damage: dmg,
         isCrit: isCrit ? 1 : 0,
-        color: isAmbush ? '#10b981' : isCrit ? '#f59e0b' : this.selectedShip.accentColor,
+        color,
         life: 1.8,
         isEnemy: false,
         pierce: pierceCount,
         hitEnemyIds: pierceCount > 0 ? new Set<number>() : undefined,
       });
+
+      if (this.gameMode === 'online') {
+        networkBullets.push({
+          x: Math.round(bx),
+          y: Math.round(by),
+          vx: Number(bvx.toFixed(2)),
+          vy: Number(bvy.toFixed(2)),
+          radius,
+          damage: dmg,
+          isCrit: isCrit ? 1 : 0,
+          color,
+          life: 1.5,
+        });
+      }
     }
 
     // LVL 5 Multi-Vector Cannons bonus: twin rear-guard blasters
     if (pulseLvl >= 5) {
       for (const offset of [Math.PI - 0.22, Math.PI + 0.22]) {
         const angle = p.angle + offset;
+        const bx = p.x + Math.cos(angle) * 14;
+        const by = p.y + Math.sin(angle) * 14;
+        const bvx = Math.cos(angle) * p.stats.bulletSpeed;
+        const bvy = Math.sin(angle) * p.stats.bulletSpeed;
         this.bullets.push({
-          x: p.x + Math.cos(angle) * 14,
-          y: p.y + Math.sin(angle) * 14,
-          vx: Math.cos(angle) * p.stats.bulletSpeed,
-          vy: Math.sin(angle) * p.stats.bulletSpeed,
+          x: bx,
+          y: by,
+          vx: bvx,
+          vy: bvy,
           radius: 4.5,
           damage: Math.round(p.stats.damage * 0.85),
           isCrit: 0,
@@ -933,7 +1260,24 @@ export class GameEngine {
           pierce: pierceCount,
           hitEnemyIds: pierceCount > 0 ? new Set<number>() : undefined,
         });
+        if (this.gameMode === 'online') {
+          networkBullets.push({
+            x: Math.round(bx),
+            y: Math.round(by),
+            vx: Number(bvx.toFixed(2)),
+            vy: Number(bvy.toFixed(2)),
+            radius: 4.5,
+            damage: 0,
+            isCrit: 0,
+            color: '#fbbf24',
+            life: 1.2,
+          });
+        }
       }
+    }
+
+    if (this.gameMode === 'online' && networkBullets.length > 0) {
+      realtimeClient.send({ type: 'player:fire', bullets: networkBullets }, false);
     }
 
     soundEngine.playLaser(1 + (Math.random() - 0.5) * 0.2);
@@ -976,6 +1320,7 @@ export class GameEngine {
       if (dist <= radius) {
         enemy.hp -= damage;
         this.damageDealt += damage;
+        this.queueOnlineDamage(enemy.id, damage);
         this.addFloatingText(enemy.x, enemy.y, `${damage}`, '#06b6d4', 18, true);
 
         // Knockback
@@ -1009,8 +1354,10 @@ export class GameEngine {
       for (const enemy of this.enemies) {
         const dist = Math.hypot(enemy.x - orbX, enemy.y - orbY);
         if (dist <= enemy.radius + orb.radius) {
-          enemy.hp -= orb.damage * dt;
-          this.damageDealt += orb.damage * dt;
+          const dmg = orb.damage * dt;
+          enemy.hp -= dmg;
+          this.damageDealt += dmg;
+          this.queueOnlineDamage(enemy.id, dmg);
 
           if (Math.random() < 0.2) {
             this.addFloatingText(enemy.x, enemy.y, `${Math.round(orb.damage)}`, '#38bdf8', 14);
@@ -1101,6 +1448,7 @@ export class GameEngine {
           if (dist <= enemy.radius + b.radius) {
             enemy.hp -= b.damage;
             this.damageDealt += b.damage;
+            this.queueOnlineDamage(enemy.id, b.damage);
             b.hitEnemyIds?.add(enemy.id);
 
             // Damage float
@@ -1144,7 +1492,9 @@ export class GameEngine {
                 if (splashEnemy !== enemy) {
                   const sDist = Math.hypot(splashEnemy.x - b.x, splashEnemy.y - b.y);
                   if (sDist <= splashRadius) {
-                    splashEnemy.hp -= Math.round(b.damage * 0.6);
+                    const splashDmg = Math.round(b.damage * 0.6);
+                    splashEnemy.hp -= splashDmg;
+                    this.queueOnlineDamage(splashEnemy.id, splashDmg);
                   }
                 }
               }
@@ -1162,6 +1512,17 @@ export class GameEngine {
         if (destroyBullet) {
           this.bullets.splice(i, 1);
         }
+      }
+    }
+
+    // Update cosmetic remote bullets from squadmates
+    for (let i = this.remoteBullets.length - 1; i >= 0; i--) {
+      const rb = this.remoteBullets[i];
+      rb.life -= dt;
+      rb.x += rb.vx;
+      rb.y += rb.vy;
+      if (rb.life <= 0) {
+        this.remoteBullets.splice(i, 1);
       }
     }
   }
@@ -1188,6 +1549,7 @@ export class GameEngine {
       for (const target of targets) {
         target.hp -= chainDmg;
         this.damageDealt += chainDmg;
+        this.queueOnlineDamage(target.id, chainDmg);
         this.addFloatingText(target.x, target.y, `⚡${chainDmg}`, '#38bdf8', 15);
 
         // Draw lightning spark particles between them
@@ -1214,6 +1576,26 @@ export class GameEngine {
 
   private updateEnemies(dt: number) {
     const p = this.player;
+
+    if (this.gameMode === 'online') {
+      const frameStep = dt * 60;
+      for (const e of this.enemies) {
+        const distToPlayer = Math.hypot(p.x - e.x, p.y - e.y);
+        if (this.isHidden && distToPlayer <= 52) {
+          this.stealthRevealTimer = 1500;
+          this.isHidden = false;
+          const spot = this.hidingSpots.find((s) => Math.hypot(p.x - s.x, p.y - s.y) <= s.radius);
+          if (spot) spot.compromisedTimer = 1.5;
+          this.addFloatingText(p.x, p.y - 26, 'SPOTTED!', '#f59e0b', 16, true);
+        }
+        e.x = Math.max(30, Math.min(this.arenaWidth - 30, e.x + e.vx * frameStep));
+        e.y = Math.max(30, Math.min(this.arenaHeight - 30, e.y + e.vy * frameStep));
+        if (distToPlayer <= p.radius + e.radius) {
+          this.damagePlayer(e.damage);
+        }
+      }
+      return;
+    }
 
     for (let i = this.enemies.length - 1; i >= 0; i--) {
       const e = this.enemies[i];
@@ -1737,8 +2119,16 @@ export class GameEngine {
 
       // Collect drop
       if (dist <= p.radius + drop.radius) {
-        this.collectDrop(drop);
-        this.drops.splice(i, 1);
+        if (this.gameMode === 'online') {
+          if (!this.pendingDropClaims.has(drop.id)) {
+            this.pendingDropClaims.add(drop.id);
+            realtimeClient.send({ type: 'drop:collect', dropId: drop.id }, false);
+            this.drops.splice(i, 1);
+          }
+        } else {
+          this.collectDrop(drop);
+          this.drops.splice(i, 1);
+        }
       }
     }
   }
@@ -1838,8 +2228,10 @@ export class GameEngine {
           const pullAngle = Math.atan2(s.y - e.y, s.x - e.x);
           e.x += Math.cos(pullAngle) * 4.5;
           e.y += Math.sin(pullAngle) * 4.5;
-          e.hp -= 20 * dt;
-          this.damageDealt += 20 * dt;
+          const sDmg = 20 * dt;
+          e.hp -= sDmg;
+          this.damageDealt += sDmg;
+          this.queueOnlineDamage(e.id, sDmg);
         }
       }
 
@@ -2020,6 +2412,11 @@ export class GameEngine {
 
     // Render Orbiting Orbs
     this.renderOrbitingOrbs(ctx);
+
+    // Render Online Squadmates
+    if (this.gameMode === 'online' && this.remotePlayers.length > 0) {
+      this.renderRemotePlayers(ctx);
+    }
 
     // Render Player
     this.renderPlayer(ctx);
@@ -2396,8 +2793,76 @@ export class GameEngine {
     ctx.restore();
   }
 
+  private renderRemotePlayers(ctx: CanvasRenderingContext2D) {
+    for (const rp of this.remotePlayers) {
+      ctx.save();
+      ctx.translate(rp.x, rp.y);
+
+      if (rp.isHidden) {
+        ctx.globalAlpha = 0.4;
+        ctx.save();
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(0, 0, 30, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (rp.shield > 0 && rp.maxShield > 0) {
+        const shieldRatio = rp.shield / rp.maxShield;
+        ctx.strokeStyle = `rgba(56, 189, 248, ${0.25 + shieldRatio * 0.4})`;
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.arc(0, 0, 24, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Ship body
+      ctx.save();
+      ctx.rotate(rp.angle);
+      ctx.fillStyle = '#0f172a';
+      ctx.strokeStyle = rp.isHidden ? '#10b981' : rp.color || '#38bdf8';
+      ctx.lineWidth = 2.5;
+
+      const r = 17;
+      ctx.beginPath();
+      ctx.moveTo(r * 1.3, 0);
+      ctx.lineTo(-r, -r * 0.9);
+      ctx.lineTo(-r * 0.5, 0);
+      ctx.lineTo(-r, r * 0.9);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = rp.isHidden ? '#34d399' : rp.accentColor || '#f472b6';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, r * 0.45, r * 0.25, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      // Callsign & HP bar above remote pilot
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${rp.pilotName} · L${rp.level}`, 0, -28);
+
+      const barW = 36;
+      const barH = 3.5;
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(-barW / 2, -23, barW, barH);
+      ctx.fillStyle = '#34d399';
+      ctx.fillRect(-barW / 2, -23, barW * Math.max(0, Math.min(1, rp.hp / Math.max(1, rp.maxHp))), barH);
+
+      ctx.restore();
+    }
+  }
+
   private renderBullets(ctx: CanvasRenderingContext2D) {
-    for (const b of this.bullets) {
+    const allBullets = this.remoteBullets.length > 0 ? [...this.bullets, ...this.remoteBullets] : this.bullets;
+    for (const b of allBullets) {
       ctx.save();
       ctx.fillStyle = b.color;
       ctx.shadowColor = b.color;
@@ -2498,6 +2963,16 @@ export class GameEngine {
       ctx.beginPath();
       ctx.arc(ex, ey, e.isBoss ? 4.2 : 1.6, 0, Math.PI * 2);
       ctx.fill();
+    }
+
+    // Remote Squadmates
+    if (this.gameMode === 'online') {
+      for (const rp of this.remotePlayers) {
+        ctx.fillStyle = rp.isHidden ? '#10b981' : '#f472b6';
+        ctx.beginPath();
+        ctx.arc(rp.x * scaleX, rp.y * scaleY, 2.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     // Player

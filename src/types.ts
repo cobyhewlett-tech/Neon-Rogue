@@ -1,6 +1,53 @@
 export type GameStatus = 'menu' | 'playing' | 'levelup' | 'paused' | 'gameover' | 'victory';
 
-export type GameMode = 'survivor' | 'endless' | 'daily';
+export type GameMode = 'survivor' | 'endless' | 'daily' | 'online';
+
+export interface ChatMessageItem {
+  id: string;
+  senderId: string;
+  pilotName: string;
+  shipName: string;
+  channel: string; // 'global' | roomId
+  text: string;
+  timestamp: number;
+  isSystem?: boolean;
+}
+
+export interface OnlinePilotSummary {
+  id: string;
+  pilotName: string;
+  shipName: string;
+  roomId: string;
+  status: 'menu' | 'playing';
+  score: number;
+}
+
+export interface OnlineRoomInfo {
+  roomId: string;
+  playerCount: number;
+  survivalTime: number;
+}
+
+export interface RemotePlayerState {
+  id: string;
+  pilotName: string;
+  shipId: string;
+  shipName: string;
+  color: string;
+  accentColor: string;
+  x: number;
+  y: number;
+  angle: number;
+  hp: number;
+  maxHp: number;
+  shield: number;
+  maxShield: number;
+  isHidden: boolean;
+  isDashing: boolean;
+  level: number;
+  score: number;
+  kills: number;
+}
 
 export interface DailyMutator {
   id: string;

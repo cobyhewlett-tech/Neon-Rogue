@@ -97,6 +97,58 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A live chat message sent by a verified pilot in an online channel.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the sender",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "channel": {
+          "type": "string",
+          "description": "Channel or squad room identifier",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "pilotName": {
+          "type": "string",
+          "description": "Public pilot callsign (no PII)",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "shipName": {
+          "type": "string",
+          "description": "Pilot vessel name at time of message",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "text": {
+          "type": "string",
+          "description": "Chat message body",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the chat message was posted"
+        }
+      },
+      "required": [
+        "uid",
+        "channel",
+        "pilotName",
+        "shipName",
+        "text",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -105,6 +157,12 @@
         "$ref": "#/entities/DailyScoreEntry"
       },
       "description": "Stores each player's personal best score for a given 24-hour UTC Daily Challenge window, keyed by {dateKey}_{uid}."
+    },
+    "/chat_messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/ChatMessage"
+      },
+      "description": "Stores persistent live chat messages for authenticated pilots in online channels."
     }
   }
 }

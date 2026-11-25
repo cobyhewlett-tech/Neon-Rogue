@@ -75,6 +75,8 @@ export const GameOverModal: React.FC<GameOverModalProps> = ({
           <p className="text-slate-400 text-xs sm:text-sm font-sans max-w-md">
             {isDaily
               ? `Daily Challenge ${summary.dailyChallengeCode || ''} (${summary.dailyMutatorName || 'Seeded Run'}) complete.`
+              : summary.gameMode === 'online'
+              ? 'Online Co-op sortie ended. Your squad continues holding the cyber-grid sector.'
               : isVictory
               ? 'Threat neutralized. The autonomous dreadnoughts were decimated and the cyber-grid has stabilized.'
               : 'Hostile forces overwhelmed your defensive perimeter. Black box telemetry recorded.'}

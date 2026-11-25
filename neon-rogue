@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$APP_DIR"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "Error: Node.js 22+ is required to run Neon Rogue."
+  exit 1
+fi
+
+if [ ! -d "node_modules" ]; then
+  echo "Installing dependencies..."
+  npm install
+fi
+
+if [ ! -f "dist/index.html" ]; then
+  echo "Building Neon Rogue production bundle..."
+  npm run build
+fi
+
+export NODE_ENV=production
+export PORT="${PORT:-3000}"
+
+echo "Launching Neon Rogue on http://localhost:${PORT} ..."
+node server.ts &
+SERVER_PID=$!
+
+cleanup() {
+  if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+for _ in $(seq 1 30); do
+  if command -v curl >/dev/null 2>&1 && curl -sf "http://localhost:${PORT}/api/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.3
+done
+
+URL="http://localhost:${PORT}"
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$URL" >/dev/null 2>&1 || true
+elif command -v open >/dev/null 2>&1; then
+  open "$URL" >/dev/null 2>&1 || true
+fi
+
+wait "$SERVER_PID"

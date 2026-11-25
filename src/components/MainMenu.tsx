@@ -2,13 +2,17 @@ import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import type { User } from 'firebase/auth';
 import {
+  ChatMessageItem,
   DailyChallengeConfig,
   DailyLeaderboardEntry,
   GameMode,
   HighScoreEntry,
+  OnlinePilotSummary,
+  OnlineRoomInfo,
   ShipClass,
 } from '../types';
 import { SHIP_CLASSES } from '../game/constants';
+import { LiveChatPanel } from './LiveChatPanel';
 import { 
   Play, 
   Shield, 
@@ -26,7 +30,12 @@ import {
   Calendar,
   LogIn,
   LogOut,
-  Lock
+  Lock,
+  Users,
+  Globe,
+  Download,
+  Terminal,
+  FileCode
 } from 'lucide-react';
 
 interface MainMenuProps {
@@ -40,6 +49,16 @@ interface MainMenuProps {
   localDailyBest: number;
   currentUser: User | null;
   authBusy: boolean;
+  pilotName: string;
+  onPilotNameChange: (name: string) => void;
+  onlineRoomId: string;
+  onOnlineRoomIdChange: (roomId: string) => void;
+  onlineCount: number;
+  onlinePilots: OnlinePilotSummary[];
+  activeRooms: OnlineRoomInfo[];
+  wsConnected: boolean;
+  chatMessages: ChatMessageItem[];
+  onSendChatMessage: (text: string, scope: 'global' | 'squad') => void;
   onSignIn: () => void;
   onSignOut: () => void;
   onToggleMute: () => void;
@@ -57,6 +76,16 @@ export const MainMenu: React.FC<MainMenuProps> = ({
   localDailyBest,
   currentUser,
   authBusy,
+  pilotName,
+  onPilotNameChange,
+  onlineRoomId,
+  onOnlineRoomIdChange,
+  onlineCount,
+  onlinePilots,
+  activeRooms,
+  wsConnected,
+  chatMessages,
+  onSendChatMessage,
   onSignIn,
   onSignOut,
   onToggleMute,
@@ -66,6 +95,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
   const [selectedMode, setSelectedMode] = useState<GameMode>('survivor');
   const [showGuideModal, setShowGuideModal] = useState(false);
   const [showScoresModal, setShowScoresModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
 
   const isDaily = selectedMode === 'daily';
   const activeShip = isDaily ? dailyConfig.ship : SHIP_CLASSES[selectedShipIndex];
@@ -111,6 +141,11 @@ export const MainMenu: React.FC<MainMenuProps> = ({
 
         {/* Top Right Utility Buttons */}
         <div className="flex items-center gap-2">
+          <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300 tabular-nums">
+            <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+            <span>{onlineCount} Online</span>
+          </div>
+
           <button
             id="btn-menu-scores"
             type="button"
@@ -129,6 +164,16 @@ export const MainMenu: React.FC<MainMenuProps> = ({
           >
             <HelpCircle className="w-4 h-4 text-cyan-400" />
             <span className="hidden sm:inline">Manual</span>
+          </button>
+
+          <button
+            id="btn-menu-export"
+            type="button"
+            onClick={() => setShowExportModal(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs font-mono text-slate-300 hover:text-emerald-300 hover:border-emerald-500/40 transition-colors cursor-pointer"
+          >
+            <Download className="w-4 h-4 text-emerald-400" />
+            <span className="hidden sm:inline">Executable</span>
           </button>
 
           <button
@@ -303,6 +348,8 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                 ? 'Survivor Protocol: Survive 10 minutes, use tactical hiding spots, and eliminate 2 massive dreadnought bosses.'
                 : selectedMode === 'daily'
                 ? `Daily Challenge (${dailyConfig.challengeCode}): Fixed 24h seeded run shared by all pilots. Compete for the daily high score.`
+                : selectedMode === 'online'
+                ? `Online Co-op (Squad ${onlineRoomId || 'PUBLIC'}): Team up in real time with other pilots against scaling waves & co-op bosses.`
                 : 'Endless Simulation: Test your survivability against exponentially scaling waves.'}
             </span>
           </div>
@@ -345,8 +392,124 @@ export const MainMenu: React.FC<MainMenuProps> = ({
               <Calendar className="w-3.5 h-3.5" />
               DAILY CHALLENGE
             </button>
+            <button
+              id="btn-mode-online"
+              type="button"
+              onClick={() => setSelectedMode('online')}
+              className={`px-3.5 py-2 rounded-xl font-mono text-xs font-bold whitespace-nowrap flex items-center gap-1.5 transition-all cursor-pointer ${
+                selectedMode === 'online'
+                  ? 'bg-violet-500 text-slate-950 shadow-md shadow-violet-500/20'
+                  : 'text-slate-400 hover:text-violet-300'
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              ONLINE CO-OP
+            </button>
           </div>
         </div>
+
+        {/* Online Co-op Matchmaking & Squad Lobby Panel */}
+        {selectedMode === 'online' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 p-5 rounded-3xl bg-slate-900/85 border border-violet-500/35 shadow-xl">
+            <div className="lg:col-span-6 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold font-mono text-violet-300 flex items-center gap-2">
+                  <Globe className="w-4 h-4" />
+                  SQUAD FREQUENCY &amp; CALLSIGN
+                </h3>
+                <span className="text-xs font-mono text-slate-400 tabular-nums">
+                  {onlineCount} Pilot{onlineCount === 1 ? '' : 's'} Connected
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1 text-xs font-mono text-slate-400">
+                  <span>Pilot Callsign</span>
+                  <input
+                    id="input-pilot-name"
+                    type="text"
+                    value={pilotName}
+                    maxLength={24}
+                    onChange={(e) => onPilotNameChange(e.target.value)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                    placeholder="Rogue Pilot"
+                    className="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 focus:border-violet-400 focus:outline-none text-slate-100 font-mono text-xs"
+                  />
+                </label>
+
+                <label className="flex flex-col gap-1 text-xs font-mono text-slate-400">
+                  <span>Squad Room Code</span>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      id="input-room-code"
+                      type="text"
+                      value={onlineRoomId}
+                      maxLength={16}
+                      onChange={(e) =>
+                        onOnlineRoomIdChange(
+                          e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, '')
+                        )
+                      }
+                      onKeyDown={(e) => e.stopPropagation()}
+                      placeholder="PUBLIC"
+                      className="flex-1 min-w-0 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 focus:border-violet-400 focus:outline-none text-slate-100 font-mono text-xs uppercase"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onOnlineRoomIdChange('PUBLIC')}
+                      className="px-2.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono text-[11px] font-bold cursor-pointer"
+                    >
+                      PUBLIC
+                    </button>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div className="lg:col-span-6 flex flex-col gap-2 lg:border-l lg:border-slate-800 lg:pl-4">
+              <div className="text-xs font-mono font-bold text-slate-300 flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-violet-400" />
+                Active Squad Rooms ({activeRooms.length})
+              </div>
+              {activeRooms.length === 0 ? (
+                <div className="py-4 px-3 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-xs font-mono text-slate-500">
+                  No squads currently deployed. Enter a room code above and launch to open{' '}
+                  <strong className="text-violet-300">{onlineRoomId || 'PUBLIC'}</strong>!
+                </div>
+              ) : (
+                <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto">
+                  {activeRooms.map((room) => (
+                    <button
+                      key={room.roomId}
+                      type="button"
+                      onClick={() => onOnlineRoomIdChange(room.roomId)}
+                      className={`px-3 py-2 rounded-xl border font-mono text-xs flex items-center gap-2 transition-colors cursor-pointer ${
+                        onlineRoomId === room.roomId
+                          ? 'bg-violet-500/20 border-violet-400 text-violet-200'
+                          : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <span className="font-bold">{room.roomId}</span>
+                      <span className="text-[11px] text-slate-400 tabular-nums">
+                        {room.playerCount} pilot{room.playerCount === 1 ? '' : 's'}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {onlinePilots.length > 0 && (
+                <div className="text-[11px] font-mono text-slate-500 truncate">
+                  Online:{' '}
+                  {onlinePilots
+                    .slice(0, 6)
+                    .map((p) => p.pilotName)
+                    .join(', ')}
+                  {onlinePilots.length > 6 ? ` +${onlinePilots.length - 6}` : ''}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Daily Challenge Briefing & Global Leaderboard Panel */}
         {isDaily && (
@@ -515,15 +678,33 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                 ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                 : isDaily
                 ? 'bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-500 hover:brightness-110 text-slate-950 shadow-emerald-500/25 cursor-pointer'
+                : selectedMode === 'online'
+                ? 'bg-gradient-to-r from-violet-500 via-fuchsia-400 to-cyan-400 hover:brightness-110 text-slate-950 shadow-violet-500/25 cursor-pointer'
                 : 'bg-gradient-to-r from-cyan-500 via-sky-400 to-blue-600 hover:brightness-110 text-slate-950 shadow-cyan-500/25 cursor-pointer'
             }`}
           >
             <Play className="w-6 h-6 fill-current" />
-            {isDaily ? 'START DAILY CHALLENGE' : 'INITIATE COMBAT RUN'}
+            {isDaily
+              ? 'START DAILY CHALLENGE'
+              : selectedMode === 'online'
+              ? 'WARP INTO CO-OP SQUAD'
+              : 'INITIATE COMBAT RUN'}
           </motion.button>
           <span className="text-xs font-mono text-slate-500">
             Controls: WASD / Arrows to Move · Mouse Aim / Auto-fire · SPACE to Dash
           </span>
+        </div>
+
+        {/* Global Live Chat Comms Panel (Accessible directly from Lobby) */}
+        <div className="w-full max-w-3xl mx-auto">
+          <LiveChatPanel
+            variant="lobby"
+            messages={chatMessages}
+            onlineCount={onlineCount}
+            isConnected={wsConnected}
+            pilotName={pilotName}
+            onSendMessage={onSendChatMessage}
+          />
         </div>
       </main>
 
@@ -639,6 +820,89 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             <button
               type="button"
               onClick={() => setShowScoresModal(false)}
+              className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-200 font-mono font-bold text-xs tracking-wider cursor-pointer"
+            >
+              CLOSE
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Download / Execution File Modal */}
+      {showExportModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md">
+          <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-2xl flex flex-col gap-4 text-slate-200">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-lg font-bold font-mono text-emerald-400 flex items-center gap-2">
+                <Download className="w-5 h-5" /> GAME EXECUTION FILES
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-3 text-xs font-sans text-slate-300">
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-emerald-500/30 flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-mono font-bold text-emerald-300 flex items-center gap-1.5">
+                    <FileCode className="w-4 h-4" />
+                    Portable Standalone Game (.html)
+                  </div>
+                  <a
+                    href="/api/download/standalone"
+                    download="NeonRogue-Game.html"
+                    className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono font-bold text-xs flex items-center gap-1.5 transition-colors shrink-0"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download
+                  </a>
+                </div>
+                <p className="text-slate-400">
+                  Single self-contained playable file. Double-click on Windows, macOS, or Linux to play Survivor, Endless, and Daily Challenge offline in any browser.
+                </p>
+              </div>
+
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 flex flex-col gap-2.5">
+                <div className="font-mono font-bold text-cyan-300 flex items-center gap-1.5">
+                  <Terminal className="w-4 h-4" />
+                  Full Server + Co-op Execution Scripts
+                </div>
+                <p className="text-slate-400">
+                  Place in the project folder to build, start the multiplayer WebSocket server, and open the game automatically:
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 font-mono">
+                  <a
+                    href="/api/download/launcher/windows"
+                    download="play-neon-rogue.bat"
+                    className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-center text-slate-200 transition-colors"
+                  >
+                    Windows (.bat)
+                  </a>
+                  <a
+                    href="/api/download/launcher/mac"
+                    download="play-neon-rogue.command"
+                    className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-center text-slate-200 transition-colors"
+                  >
+                    macOS (.command)
+                  </a>
+                  <a
+                    href="/api/download/launcher/linux"
+                    download="neon-rogue.sh"
+                    className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-center text-slate-200 transition-colors"
+                  >
+                    Linux (.sh)
+                  </a>
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowExportModal(false)}
               className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-200 font-mono font-bold text-xs tracking-wider cursor-pointer"
             >
               CLOSE

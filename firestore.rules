@@ -100,16 +100,52 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidChatMessage(data) {
+      return data.keys().hasAll([
+          'uid',
+          'channel',
+          'pilotName',
+          'shipName',
+          'text',
+          'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'channel',
+          'pilotName',
+          'shipName',
+          'text',
+          'createdAt'
+        ])
+        && data.uid is string
+        && data.uid == request.auth.uid
+        && isValidId(data.uid)
+        && data.channel is string
+        && data.channel.size() >= 1
+        && data.channel.size() <= 32
+        && data.channel.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.pilotName is string
+        && data.pilotName.size() >= 1
+        && data.pilotName.size() <= 32
+        && data.shipName is string
+        && data.shipName.size() >= 1
+        && data.shipName.size() <= 48
+        && data.text is string
+        && data.text.size() >= 1
+        && data.text.size() <= 240
+        && data.createdAt is timestamp;
+    }
+
     match /daily_scores/{entryId} {
       // Public leaderboard reads: strictly scoped to valid score documents (no PII stored)
       allow get: if isValidId(entryId)
         && resource.data.dateKey is string
         && resource.data.score is int;
 
-      allow list: if resource.data.dateKey is string
-        && resource.data.score is int
-        && 'limit' in request.query
-        && request.query.limit is int
+      // List queries must filter on dateKey (YYYY-MM-DD) and bound limit <= 50
+      allow list: if resource.data.dateKey >= '2020-01-01'
+        && resource.data.dateKey <= '2099-12-31'
+        && request.query.limit != null
         && request.query.limit > 0
         && request.query.limit <= 50;
 
@@ -144,6 +180,28 @@ service cloud.firestore {
         ]);
 
       allow delete: if false;
+    }
+
+    match /chat_messages/{messageId} {
+      allow get: if isSignedIn()
+        && isValidId(messageId)
+        && resource.data.channel is string
+        && resource.data.text is string;
+
+      // List queries must filter by channel and bound limit <= 50
+      allow list: if isSignedIn()
+        && resource.data.channel >= '-'
+        && resource.data.channel <= 'z\uf8ff'
+        && request.query.limit != null
+        && request.query.limit > 0
+        && request.query.limit <= 50;
+
+      allow create: if isVerifiedUser()
+        && isValidId(messageId)
+        && isValidChatMessage(incoming())
+        && incoming().createdAt == request.time;
+
+      allow update, delete: if false;
     }
   }
 }

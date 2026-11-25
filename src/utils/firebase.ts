@@ -7,6 +7,7 @@ import {
   User,
 } from 'firebase/auth';
 import {
+  addDoc,
   collection,
   doc,
   getDoc,
@@ -21,7 +22,12 @@ import {
   where,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { DailyChallengeConfig, DailyLeaderboardEntry, RunSummary } from '../types';
+import {
+  ChatMessageItem,
+  DailyChallengeConfig,
+  DailyLeaderboardEntry,
+  RunSummary,
+} from '../types';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -237,3 +243,75 @@ export async function submitDailyScore(
     return { submitted: false, isNewPersonalBest: false, bestScore: prevScore };
   }
 }
+
+export function subscribeGlobalChat(
+  channel: string,
+  onUpdate: (messages: ChatMessageItem[]) => void,
+  onError?: (err: Error) => void
+): () => void {
+  const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || 'global';
+  const path = 'chat_messages';
+  const q = query(collection(db, path), where('channel', '==', safeChannel), limit(50));
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const msgs: ChatMessageItem[] = snapshot.docs.map((docSnap) => {
+        const d = docSnap.data();
+        const ts =
+          d.createdAt && typeof d.createdAt.toMillis === 'function'
+            ? d.createdAt.toMillis()
+            : Date.now();
+        return {
+          id: docSnap.id,
+          senderId: String(d.uid || ''),
+          pilotName: String(d.pilotName || 'Rogue Pilot'),
+          shipName: String(d.shipName || 'Interceptor'),
+          channel: String(d.channel || safeChannel),
+          text: String(d.text || ''),
+          timestamp: ts,
+        };
+      });
+      msgs.sort((a, b) => a.timestamp - b.timestamp);
+      onUpdate(msgs);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch (wrapped) {
+        if (onError && wrapped instanceof Error) {
+          onError(wrapped);
+        }
+      }
+    }
+  );
+}
+
+export async function saveChatMessageToFirestore(
+  user: User,
+  channel: string,
+  pilotName: string,
+  shipName: string,
+  text: string
+): Promise<void> {
+  const safeChannel = channel.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || 'global';
+  const safePilot = (pilotName || deriveSafePilotName(user)).replace(/\s+/g, ' ').trim().slice(0, 32) || 'Rogue Pilot';
+  const safeShip = (shipName || 'Striker MK-IV').trim().slice(0, 48) || 'Striker MK-IV';
+  const safeText = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 240);
+  if (!safeText) return;
+
+  const path = 'chat_messages';
+  try {
+    await addDoc(collection(db, path), {
+      uid: user.uid,
+      channel: safeChannel,
+      pilotName: safePilot,
+      shipName: safeShip,
+      text: safeText,
+      createdAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+

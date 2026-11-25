@@ -1,6 +1,7 @@
 import React from 'react';
-import { GameMode, PlayerStats } from '../types';
+import { ChatMessageItem, GameMode, PlayerStats } from '../types';
 import { UPGRADE_CATALOG } from '../game/constants';
+import { LiveChatPanel } from './LiveChatPanel';
 import { 
   Shield, 
   Heart, 
@@ -24,6 +25,13 @@ interface HUDProps {
   highScore: number;
   gameMode: GameMode;
   dailyCode?: string;
+  onlineRoomId?: string;
+  squadPlayerCount?: number;
+  onlineCount: number;
+  wsConnected: boolean;
+  pilotName: string;
+  chatMessages: ChatMessageItem[];
+  onSendChatMessage: (text: string, scope: 'global' | 'squad') => void;
   bossState: { name: string; hp: number; maxHp: number } | null;
   isMuted: boolean;
   autoFire: boolean;
@@ -41,6 +49,13 @@ export const HUD: React.FC<HUDProps> = ({
   highScore,
   gameMode,
   dailyCode,
+  onlineRoomId,
+  squadPlayerCount = 1,
+  onlineCount,
+  wsConnected,
+  pilotName,
+  chatMessages,
+  onSendChatMessage,
   bossState,
   isMuted,
   autoFire,
@@ -116,6 +131,14 @@ export const HUD: React.FC<HUDProps> = ({
                 <div className="h-4 w-px bg-slate-700" />
                 <span className="text-xs font-bold text-emerald-400 tracking-wide whitespace-nowrap">
                   DAILY · {dailyCode}
+                </span>
+              </>
+            )}
+            {gameMode === 'online' && onlineRoomId && (
+              <>
+                <div className="h-4 w-px bg-slate-700" />
+                <span className="text-xs font-bold text-violet-300 tracking-wide whitespace-nowrap">
+                  ONLINE · SQUAD {onlineRoomId} · {squadPlayerCount} {squadPlayerCount === 1 ? 'PILOT' : 'PILOTS'}
                 </span>
               </>
             )}
@@ -266,8 +289,17 @@ export const HUD: React.FC<HUDProps> = ({
           })}
         </div>
 
-        {/* Right: Dash Thruster status with click-to-dash on touch */}
-        <div className="pointer-events-auto flex items-center gap-3">
+        {/* Right: Live Chat overlay + Dash Thruster */}
+        <div className="pointer-events-auto flex flex-col items-end gap-2.5">
+          <LiveChatPanel
+            variant="hud"
+            messages={chatMessages}
+            squadRoomId={gameMode === 'online' ? onlineRoomId : undefined}
+            onlineCount={onlineCount}
+            isConnected={wsConnected}
+            pilotName={pilotName}
+            onSendMessage={onSendChatMessage}
+          />
           <button
             id="btn-hud-dash"
             type="button"
